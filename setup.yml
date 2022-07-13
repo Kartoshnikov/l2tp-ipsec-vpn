@@ -1,0 +1,121 @@
+---
+- name: Set up L2TP/IPSec server from the scratch
+  hosts: all
+  become: yes
+  vars:
+    ipsec_secret_psk: "test"
+    l2tp_pool: "172.16.0.0/16"
+    xl2tpd_ip_range: "172.16.0.2-172.16.255.254"
+    xl2tpd_local_ip: "172.16.0.1"
+    l2tp_tunnel_key: "test"
+  tasks:
+  - name: Install packages
+    apt:
+      name: "{{ package }}"
+      state: present
+      cache_valid_time: 86400
+    loop:
+    - strongswan
+    - xl2tpd
+    - ppp
+    - iptables-persistent
+    loop_control:
+      loop_var: "package"
+
+  - name: Deliver config files
+    template:
+      src: "{{ file.src }}"
+      dest: "{{ file.dest }}"
+    notify: "restart strongswan"
+    loop_control:
+      loop_var: "file"
+    loop:
+    - {src: "ipsec.conf", dest: "/etc/ipsec.conf"}
+    - {src: "ipsec.secrets", dest: "/etc/ipsec.secrets"}
+
+  - name: Deliver config files
+    template:
+      src: "{{ file.src }}"
+      dest: "{{ file.dest }}"
+    notify: "restart l2tpd"
+    loop_control:
+      loop_var: "file"
+    loop:
+    - {src: "xl2tpd.conf", dest: "/etc/xl2tpd/xl2tpd.conf"}
+    - {src: "l2tp-secrets", dest: "/etc/xl2tpd/l2tp-secrets"}
+    - {src: "options.xl2tpd", dest: "/etc/ppp/options.xl2tpd"}
+    - {src: "chap-secrets", dest: "/etc/ppp/chap-secrets"}
+
+  - name: Set up sysctl params
+    sysctl:
+      name: "{{ item.name }}"
+      value: "{{ item.value }}"
+      state: present
+      sysctl_set: yes
+      reload: yes
+    loop:
+    - {name: 'net.ipv4.ip_forward', value: '1'}
+    - {name: 'net.ipv4.conf.all.accept_redirects', value: '0'}
+    - {name: 'net.ipv4.conf.all.send_redirects', value: '0'}
+    - {name: 'net.ipv4.conf.default.rp_filter', value: '0'}
+    - {name: 'net.ipv4.conf.default.accept_source_route', value: '0'}
+    - {name: 'net.ipv4.conf.default.send_redirects', value: '0'}
+    - {name: 'net.ipv4.icmp_ignore_bogus_error_responses', value: '1'}
+
+  - name: Make sure /etc/rc.local is correct
+    lineinfile:
+      path: /etc/rc.local
+      line: 'exit 0'
+      state: present
+      regex: '^exit 0$'
+      insertafter: EOF
+      create: yes
+      mode: 755
+
+  - name: Add script to /etc/rc.local
+    lineinfile:
+      path: /etc/rc.local
+      line: 'for vpn in /proc/sys/net/ipv4/conf/*; do echo 0 > $vpn/accept_redirects; echo 0 > $vpn/send_redirects; done'
+      regexp: '^for vpn'
+      insertbefore: '^exit 0$'
+      state: present
+
+  - name: iptables - allow 1701 UDP
+    iptables:
+      chain: INPUT
+      action: insert
+      rule_num: "{{ ansible_loop.index }}"
+      protocol: udp
+      destination_port: "{{ port }}"
+      jump: ACCEPT
+    notify: save iptables
+    loop_control:
+      extended: yes
+      loop_var: port
+    loop:
+      - '500'
+      - '1701'
+      - '4500'
+
+  - name: iptables - SNAT
+    iptables:
+      table: nat
+      chain: POSTROUTING
+      out_interface: "{{ hostvars[inventory_hostname].ansible_default_ipv4.interface }}"
+      source: "{{ l2tp_pool }}"
+      jump: "MASQUERADE"
+    notify: save iptables
+
+  handlers:
+  - name: restart strongswan
+    systemd:
+      name: strongswan-starter.service
+      state: restarted
+
+  - name: restart l2tpd
+    systemd: 
+      name: l2tpd.service
+      state: restarted
+
+  - name: save iptables
+    command: netfilter-persistent save
